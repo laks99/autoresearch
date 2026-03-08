@@ -141,7 +141,7 @@ def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
 def train_tokenizer():
     """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
     tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.npz")
+    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
 
     if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
         print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
@@ -246,9 +246,8 @@ class Tokenizer:
 
 
 def get_token_bytes():
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.npz")
-    data = mx.load(path)
-    return data["arr_0"]
+    path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
+    return mx.load(path)
 
 
 def _document_batches(split, tokenizer_batch_size=128):

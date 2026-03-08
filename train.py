@@ -835,7 +835,7 @@ if __name__ == "__main__":
     steady_state_mfu = (100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10)
                         / total_training_time / M3_ULTRA_BF16_PEAK_FLOPS
                         if total_training_time > 0 else 0)
-    peak_memory_mb = mx.metal.get_active_memory() / 1024 / 1024
+    peak_memory_mb = mx.get_active_memory() / 1024 / 1024
 
     print("---")
     print(f"val_bpb:          {val_bpb:.6f}")
