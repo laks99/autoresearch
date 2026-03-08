@@ -643,7 +643,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 64   # per-device batch size (conservative for M3 Ultra)
+DEVICE_BATCH_SIZE = 256  # per-device batch size (M3 Ultra 256GB, eliminates grad accum)
 
 # Hardware
 M3_ULTRA_BF16_PEAK_FLOPS = 49.15e12
