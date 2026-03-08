@@ -9,6 +9,7 @@ import gc
 import math
 import time
 from dataclasses import dataclass, asdict
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -737,6 +738,15 @@ if __name__ == "__main__":
 
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
+    # State arrays for mx.compile capture: model params, optimizer state, RNG
+    state = [model.state, optimizer.state, mx.random.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def compiled_step(x, y):
+        loss, grads = loss_and_grad_fn(model, x, y)
+        optimizer.update(model, grads)
+        return loss
+
     # -------------------------------------------------------------------
     # Training loop
     # -------------------------------------------------------------------
@@ -749,23 +759,8 @@ if __name__ == "__main__":
     while True:
         t0 = time.time()
 
-        # Gradient accumulation
-        accum_grads = None
-        for micro_step in range(grad_accum_steps):
-            loss, grads = loss_and_grad_fn(model, x, y)
-            if accum_grads is None:
-                accum_grads = grads
-            else:
-                accum_grads = tree_map(lambda a, g: a + g, accum_grads, grads)
-            mx.eval(loss, accum_grads)
-            train_loss = loss  # keep last micro-batch loss for logging
-            x, y, epoch = next(train_loader)
-
-        # Average accumulated gradients
-        accum_grads = tree_map(lambda g: g * (1.0 / grad_accum_steps), accum_grads)
-
-        # Progress and schedules
-        progress = min(total_training_time / TIME_BUDGET, 1.0)
+        # Progress and schedules (must be set before compiled step)
+        progress = min(total_training_time / TIME_BUDGET, 1.0) if step > 0 else 0.0
         lrm = get_lr_multiplier(progress)
         muon_momentum = get_muon_momentum(step)
         muon_weight_decay = get_weight_decay(progress)
@@ -774,9 +769,28 @@ if __name__ == "__main__":
         optimizer.set_muon_momentum(muon_momentum)
         optimizer.set_muon_weight_decay(muon_weight_decay)
 
-        # Optimizer step
-        optimizer.update(model, accum_grads)
-        mx.eval(model.parameters(), *optimizer.state)
+        # Forward + backward + optimizer update
+        if grad_accum_steps == 1:
+            # Compiled path: single step, fused kernels
+            train_loss = compiled_step(x, y)
+            mx.eval(train_loss)
+            x, y, epoch = next(train_loader)
+        else:
+            # Fallback: uncompiled gradient accumulation
+            accum_grads = None
+            for micro_step in range(grad_accum_steps):
+                loss, grads = loss_and_grad_fn(model, x, y)
+                if accum_grads is None:
+                    accum_grads = grads
+                else:
+                    accum_grads = tree_map(lambda a, g: a + g, accum_grads, grads)
+                mx.eval(loss, accum_grads)
+                train_loss = loss
+                x, y, epoch = next(train_loader)
+            accum_grads = tree_map(lambda g: g * (1.0 / grad_accum_steps), accum_grads)
+
+            optimizer.update(model, accum_grads)
+            mx.eval(model.parameters(), *optimizer.state)
 
         train_loss_f = train_loss.item()
 
