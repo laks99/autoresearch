@@ -405,11 +405,9 @@ class MuonAdamW:
             for path in group["paths"]:
                 self._path_to_group[path] = gi
 
-        # Store initial LRs for scheduling
-        self.initial_lrs = {}
+        # Store initial LRs for scheduling (on each group, matching upstream)
         for group in param_groups:
-            for path in group["paths"]:
-                self.initial_lrs[path] = group["lr"]
+            group["initial_lr"] = group["lr"]
 
         # Initialize optimizer state lazily (on first update)
         self._adam_state = {}   # path -> {"exp_avg", "exp_avg_sq", "step"}
@@ -517,9 +515,7 @@ class MuonAdamW:
     def set_lr_multiplier(self, multiplier):
         """Scale all learning rates by multiplier (relative to initial LRs)."""
         for group in self.param_groups:
-            for path in group["paths"]:
-                group["lr"] = self.initial_lrs[path] * multiplier
-                break  # all paths in group share the same LR
+            group["lr"] = group["initial_lr"] * multiplier
 
     def set_muon_momentum(self, momentum):
         """Set momentum for all Muon groups."""
@@ -780,7 +776,7 @@ if __name__ == "__main__":
 
         # Optimizer step
         optimizer.update(model, accum_grads)
-        mx.eval(model.parameters(), optimizer.state)
+        mx.eval(model.parameters(), *optimizer.state)
 
         train_loss_f = train_loss.item()
 
@@ -806,8 +802,12 @@ if __name__ == "__main__":
 
         print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
-        # GC management
+        # GC management (Python's GC causes ~500ms stalls)
         if step == 0:
+            gc.collect()
+            gc.freeze()
+            gc.disable()
+        elif (step + 1) % 5000 == 0:
             gc.collect()
 
         step += 1
