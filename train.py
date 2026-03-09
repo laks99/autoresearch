@@ -6,10 +6,13 @@ Usage: uv run train.py
 """
 
 import gc
+import json
 import math
+import os
 import time
 from dataclasses import dataclass, asdict
 from functools import partial
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -656,6 +659,114 @@ DEVICE_BATCH_SIZE = 256  # per-device batch size (M3 Ultra 256GB, eliminates gra
 
 # Hardware
 M3_ULTRA_BF16_PEAK_FLOPS = 49.15e12
+
+# Checkpointing
+CHECKPOINT_DIR = Path("checkpoints")
+CHECKPOINT_INTERVAL_MINUTES = 60   # save every N minutes of wall-clock time
+CHECKPOINT_MAX_AGE_HOURS = 24      # auto-delete checkpoints older than this
+
+# ---------------------------------------------------------------------------
+# Checkpoint save/load/clean
+# ---------------------------------------------------------------------------
+
+
+def save_checkpoint(model, optimizer, step, total_training_time, loss, epoch):
+    """Save model weights, optimizer state, and metadata to checkpoints/ dir."""
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
+    prefix = CHECKPOINT_DIR / f"step_{step:06d}"
+
+    # Model weights
+    mx.save_safetensors(str(prefix) + ".safetensors", dict(tree_flatten(model.parameters())))
+
+    # Optimizer state — flatten with prefixed keys
+    opt_state = {}
+    for path, s in optimizer._adam_state.items():
+        opt_state[f"adam.{path}.exp_avg"] = s["exp_avg"]
+        opt_state[f"adam.{path}.exp_avg_sq"] = s["exp_avg_sq"]
+    for path, s in optimizer._muon_state.items():
+        opt_state[f"muon.{path}.momentum_buffer"] = s["momentum_buffer"]
+        opt_state[f"muon.{path}.second_momentum_buffer"] = s["second_momentum_buffer"]
+    mx.save_safetensors(str(prefix) + "_optimizer.safetensors", opt_state)
+
+    # Metadata
+    meta = {
+        "step": step,
+        "total_training_time": total_training_time,
+        "loss": float(loss),
+        "epoch": epoch,
+        "timestamp": time.time(),
+    }
+    with open(str(prefix) + "_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"\n  Checkpoint saved: step {step} ({prefix})")
+    return meta["timestamp"]
+
+
+def load_latest_checkpoint(model, optimizer):
+    """Scan checkpoints/ for latest checkpoint. Returns (step, total_training_time, epoch) or None."""
+    if not CHECKPOINT_DIR.exists():
+        return None
+
+    meta_files = sorted(CHECKPOINT_DIR.glob("step_*_meta.json"))
+    if not meta_files:
+        return None
+
+    latest_meta_path = meta_files[-1]
+    prefix = str(latest_meta_path).replace("_meta.json", "")
+
+    # Load metadata
+    with open(latest_meta_path) as f:
+        meta = json.load(f)
+
+    # Load model weights
+    weights = mx.load(prefix + ".safetensors")
+    model.load_weights(list(weights.items()))
+
+    # Load optimizer state
+    opt_data = mx.load(prefix + "_optimizer.safetensors")
+    for key, arr in opt_data.items():
+        parts = key.split(".", 2)  # e.g., "adam", "blocks.0.attn.c_q.weight", "exp_avg"
+        kind = parts[0]
+        field = parts[-1]
+        path = key[len(kind) + 1 : -(len(field) + 1)]  # strip kind. and .field
+
+        if kind == "adam":
+            if path not in optimizer._adam_state:
+                optimizer._adam_state[path] = {"exp_avg": None, "exp_avg_sq": None, "step": meta["step"]}
+            optimizer._adam_state[path][field] = arr
+        elif kind == "muon":
+            if path not in optimizer._muon_state:
+                optimizer._muon_state[path] = {"momentum_buffer": None, "second_momentum_buffer": None}
+            optimizer._muon_state[path][field] = arr
+
+    # Restore adam step counters
+    for s in optimizer._adam_state.values():
+        s["step"] = meta["step"]
+
+    mx.eval(model.parameters(), *optimizer.state)
+
+    print(f"  Resumed from checkpoint: step {meta['step']}, training_time {meta['total_training_time']:.1f}s")
+    return meta["step"], meta["total_training_time"], meta.get("epoch", 0)
+
+
+def clean_old_checkpoints(max_age_hours):
+    """Remove checkpoint files older than max_age_hours."""
+    if not CHECKPOINT_DIR.exists():
+        return
+    cutoff = time.time() - max_age_hours * 3600
+    meta_files = sorted(CHECKPOINT_DIR.glob("step_*_meta.json"))
+    for meta_path in meta_files:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if meta["timestamp"] < cutoff:
+            prefix = str(meta_path).replace("_meta.json", "")
+            for ext in [".safetensors", "_optimizer.safetensors", "_meta.json"]:
+                p = prefix + ext
+                if os.path.exists(p):
+                    os.remove(p)
+            print(f"\n  Cleaned old checkpoint: {Path(prefix).name}")
+
 
 # ---------------------------------------------------------------------------
 # Training loop
