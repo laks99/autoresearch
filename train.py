@@ -655,7 +655,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 256  # per-device batch size (M3 Ultra 256GB, eliminates grad accum)
+DEVICE_BATCH_SIZE = 64   # per-device batch size (larger OOMs with mx.compile trace)
 
 # Hardware
 M3_ULTRA_BF16_PEAK_FLOPS = 49.15e12
@@ -874,18 +874,16 @@ if __name__ == "__main__":
 
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-    # State for mx.compile capture: model params, optimizer state dicts, RNG.
-    # We pass the internal mutable dicts (not optimizer.state which returns a
-    # detached flat list) so mx.compile can track in-place updates.
+    # Compiled forward+backward pass (kernel fusion, ~10% speedup).
+    # Only model state and RNG are captured — optimizer state is not needed
+    # since the optimizer runs outside the compiled function (after grad accum).
     # NOTE: this must come AFTER checkpoint load, because loading replaces
-    # model/optimizer arrays and state capture needs the final references.
-    state = [model.state, optimizer._adam_state, optimizer._muon_state, mx.random.state]
+    # model arrays and state capture needs the final references.
+    fwd_bwd_state = [model.state, mx.random.state]
 
-    @partial(mx.compile, inputs=state, outputs=state)
-    def compiled_step(x, y):
-        loss, grads = loss_and_grad_fn(model, x, y)
-        optimizer.update(model, grads)
-        return loss
+    @partial(mx.compile, inputs=fwd_bwd_state, outputs=fwd_bwd_state)
+    def compiled_fwd_bwd(x, y):
+        return loss_and_grad_fn(model, x, y)
 
     # -------------------------------------------------------------------
     # Training loop
@@ -911,30 +909,21 @@ if __name__ == "__main__":
         optimizer.set_muon_momentum(muon_momentum)
         optimizer.set_muon_weight_decay(muon_weight_decay)
 
-        # Forward + backward + optimizer update
-        if grad_accum_steps == 1:
-            # Compiled path: single step, fused kernels
-            train_loss = compiled_step(x, y)
-            mx.eval(train_loss)
+        # Forward + backward (compiled) + gradient accumulation + optimizer update
+        accum_grads = None
+        for micro_step in range(grad_accum_steps):
+            loss, grads = compiled_fwd_bwd(x, y)
+            if accum_grads is None:
+                accum_grads = grads
+            else:
+                accum_grads = tree_map(lambda a, g: a + g, accum_grads, grads)
+            mx.eval(loss, accum_grads)
+            train_loss = loss
             x, y, epoch = next(train_loader)
-        else:
-            # Fallback: uncompiled gradient accumulation
-            # Note: schedules applied before forward pass (differs from original ordering
-            # but uses same progress value, so results are equivalent)
-            accum_grads = None
-            for micro_step in range(grad_accum_steps):
-                loss, grads = loss_and_grad_fn(model, x, y)
-                if accum_grads is None:
-                    accum_grads = grads
-                else:
-                    accum_grads = tree_map(lambda a, g: a + g, accum_grads, grads)
-                mx.eval(loss, accum_grads)
-                train_loss = loss
-                x, y, epoch = next(train_loader)
-            accum_grads = tree_map(lambda g: g * (1.0 / grad_accum_steps), accum_grads)
+        accum_grads = tree_map(lambda g: g * (1.0 / grad_accum_steps), accum_grads)
 
-            optimizer.update(model, accum_grads)
-            mx.eval(model.parameters(), *optimizer.state)
+        optimizer.update(model, accum_grads)
+        mx.eval(model.parameters(), *optimizer.state)
 
         train_loss_f = train_loss.item()
 
