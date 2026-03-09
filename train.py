@@ -726,10 +726,9 @@ def load_latest_checkpoint(model, optimizer):
     # Load optimizer state
     opt_data = mx.load(prefix + "_optimizer.safetensors")
     for key, arr in opt_data.items():
-        parts = key.split(".", 2)  # e.g., "adam", "blocks.0.attn.c_q.weight", "exp_avg"
-        kind = parts[0]
-        field = parts[-1]
-        path = key[len(kind) + 1 : -(len(field) + 1)]  # strip kind. and .field
+        kind = key.split(".", 1)[0]  # "adam" or "muon"
+        field = key.rsplit(".", 1)[-1]  # "exp_avg", "exp_avg_sq", "momentum_buffer", etc.
+        path = key[len(kind) + 1 : -(len(field) + 1)]  # strip "kind." prefix and ".field" suffix
 
         if kind == "adam":
             if path not in optimizer._adam_state:
