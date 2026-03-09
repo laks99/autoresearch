@@ -849,8 +849,20 @@ if __name__ == "__main__":
         weight_decay=WEIGHT_DECAY,
     )
 
+    # Attempt to resume from checkpoint
+    resumed = load_latest_checkpoint(model, optimizer)
+    resume_step = 0
+    resume_training_time = 0.0
+    if resumed:
+        resume_step, resume_training_time, _ = resumed
+
     train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
     x, y, epoch = next(train_loader)  # prefetch first batch
+
+    # Skip ahead in dataloader if resuming (approximate)
+    if resume_step > 0:
+        for _ in range(resume_step * grad_accum_steps - 1):
+            x, y, epoch = next(train_loader)
 
     print(f"Time budget: {TIME_BUDGET}s")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -860,6 +872,8 @@ if __name__ == "__main__":
     # State for mx.compile capture: model params, optimizer state dicts, RNG.
     # We pass the internal mutable dicts (not optimizer.state which returns a
     # detached flat list) so mx.compile can track in-place updates.
+    # NOTE: this must come AFTER checkpoint load, because loading replaces
+    # model/optimizer arrays and state capture needs the final references.
     state = [model.state, optimizer._adam_state, optimizer._muon_state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
@@ -874,8 +888,10 @@ if __name__ == "__main__":
 
     t_start_training = time.time()
     smooth_train_loss = 0
-    total_training_time = 0
-    step = 0
+    total_training_time = resume_training_time
+    step = resume_step
+
+    last_checkpoint_time = time.time()
 
     while True:
         t0 = time.time()
@@ -939,6 +955,13 @@ if __name__ == "__main__":
 
         print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
+        # Periodic checkpointing
+        now = time.time()
+        if now - last_checkpoint_time >= CHECKPOINT_INTERVAL_MINUTES * 60:
+            save_checkpoint(model, optimizer, step, total_training_time, train_loss_f, epoch)
+            clean_old_checkpoints(CHECKPOINT_MAX_AGE_HOURS)
+            last_checkpoint_time = now
+
         # GC management (Python's GC causes ~500ms stalls)
         if step == 0:
             gc.collect()
@@ -954,6 +977,11 @@ if __name__ == "__main__":
             break
 
     print()  # newline after \r training log
+
+    # Save final checkpoint
+    save_checkpoint(model, optimizer, step, total_training_time,
+                    train_loss_f if 'train_loss_f' in dir() else 0, epoch)
+    clean_old_checkpoints(CHECKPOINT_MAX_AGE_HOURS)
 
     total_tokens = step * TOTAL_BATCH_SIZE
 
