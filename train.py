@@ -712,8 +712,14 @@ def load_latest_checkpoint(model, optimizer):
     if not meta_files:
         return None
 
-    latest_meta_path = meta_files[-1]
-    prefix = str(latest_meta_path).replace("_meta.json", "")
+    # Find latest complete checkpoint (all 3 files present)
+    for latest_meta_path in reversed(meta_files):
+        prefix = str(latest_meta_path).replace("_meta.json", "")
+        if (os.path.exists(prefix + ".safetensors") and
+                os.path.exists(prefix + "_optimizer.safetensors")):
+            break
+    else:
+        return None  # no complete checkpoint found
 
     # Load metadata
     with open(latest_meta_path) as f:
@@ -978,8 +984,7 @@ if __name__ == "__main__":
     print()  # newline after \r training log
 
     # Save final checkpoint
-    save_checkpoint(model, optimizer, step, total_training_time,
-                    train_loss_f if 'train_loss_f' in dir() else 0, epoch)
+    save_checkpoint(model, optimizer, step, total_training_time, train_loss_f, epoch)
     clean_old_checkpoints(CHECKPOINT_MAX_AGE_HOURS)
 
     total_tokens = step * TOTAL_BATCH_SIZE
