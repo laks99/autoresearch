@@ -410,9 +410,21 @@ class MuonAdamW:
         for group in param_groups:
             group["initial_lr"] = group["lr"]
 
-        # Initialize optimizer state lazily (on first update)
+        # Initialize optimizer state eagerly for mx.compile compatibility.
+        # mx.compile captures mutable containers by reference; lazy init would
+        # leave these dicts empty at capture time, so state wouldn't persist.
         self._adam_state = {}   # path -> {"exp_avg", "exp_avg_sq", "step"}
         self._muon_state = {}   # path -> {"momentum_buffer", "second_momentum_buffer"}
+
+        flat_params = dict(tree_flatten(model.parameters()))
+        for path in self._path_to_group:
+            gi = self._path_to_group[path]
+            group = self.param_groups[gi]
+            param = flat_params[path]
+            if group["kind"] == "adamw":
+                self._init_adam_state(path, param)
+            elif group["kind"] == "muon":
+                self._init_muon_state(path, param)
 
     def _init_adam_state(self, path, param):
         self._adam_state[path] = {
@@ -477,8 +489,6 @@ class MuonAdamW:
                 setattr(obj, last, new_param)
 
     def _step_adamw(self, path, grad, param, group):
-        if path not in self._adam_state:
-            self._init_adam_state(path, param)
         state = self._adam_state[path]
         state["step"] += 1
         new_param, new_ea, new_eas = adamw_step(
@@ -493,8 +503,6 @@ class MuonAdamW:
         return new_param
 
     def _step_muon(self, path, grad, param, group):
-        if path not in self._muon_state:
-            self._init_muon_state(path, param)
         state = self._muon_state[path]
         rows, cols = param.shape
         red_dim = -1 if rows >= cols else -2
@@ -738,8 +746,10 @@ if __name__ == "__main__":
 
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-    # State arrays for mx.compile capture: model params, optimizer state, RNG
-    state = [model.state, optimizer.state, mx.random.state]
+    # State for mx.compile capture: model params, optimizer state dicts, RNG.
+    # We pass the internal mutable dicts (not optimizer.state which returns a
+    # detached flat list) so mx.compile can track in-place updates.
+    state = [model.state, optimizer._adam_state, optimizer._muon_state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
     def compiled_step(x, y):
@@ -777,6 +787,8 @@ if __name__ == "__main__":
             x, y, epoch = next(train_loader)
         else:
             # Fallback: uncompiled gradient accumulation
+            # Note: schedules applied before forward pass (differs from original ordering
+            # but uses same progress value, so results are equivalent)
             accum_grads = None
             for micro_step in range(grad_accum_steps):
                 loss, grads = loss_and_grad_fn(model, x, y)
